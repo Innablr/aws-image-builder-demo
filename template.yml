@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "EC2 Image Builder Stack - Windows Server 2019"
+
+Parameters:
+  BaseImageArn:
+    Type: String
+    Description: "The base AMI ARN to be used for your Image Recipe to build upon."
+    Default: "arn:aws:imagebuilder:ap-southeast-2:aws:image/windows-server-2019-english-full-base-x86/x.x.x"
+  CisScriptS3Uri:
+    Type: String
+    Description: "The URI of the CIS level one scripts for the custom component"
+    Default: "innablr-demo-resources/image-builder-component/"
+  Description:
+    Type: String
+    Description: "A general description of your image resources"
+    Default: "Hardened Windows Server 2019 image"
+  ImageName:
+    Type: String
+    Description: "Desired name of your image resources"
+    Default: "windows-server-2019-hardened"
+  Version:
+    Type: String
+    Description: "The semantic version of the deployment. You must increment this value for every CloudFormation change"
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 7
+
+  Topic:
+    Type: AWS::SNS::Topic
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: ImageBuilderPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                  - "ec2:CreateTags"
+                  - "ec2:AttachVolume"
+                  - "ec2:CreateTags"
+                  - "ec2:CreateVolume"
+                  - "ec2:DeleteVolume"
+                  - "ec2:DescribeVolumes"
+                  - "ec2:DetachVolume"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder"
+        - "arn:aws:iam::aws:policy/AWSImageBuilderFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM"
+        - "arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref Role
+
+  ImageArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/image-arn"
+      Type: String
+      Value: !Sub "arn:aws:imagebuilder:${AWS::Region}:${AWS::AccountId}:image/${ImageName}/x.x.x"
+
+  Pipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Description: !Sub "${Description}"
+      ImageRecipeArn: !Ref Recipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      Name: !Ref ImageName
+      DistributionConfigurationArn: !Ref DistributionConfiguration
+      Schedule:
+        PipelineExecutionStartCondition: EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE
+        ScheduleExpression: "cron(0 0 12 1/1 * ? *)" # 12:00PM UTC / 22:00PM AEST Daily
+
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Description: !Ref Description
+      TerminateInstanceOnFailure: false
+      InstanceProfileName: !Ref InstanceProfile
+      Name: !Ref ImageName
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref Bucket
+          S3KeyPrefix: !Sub "${ImageName}/Logs"
+      SnsTopicArn: !Ref Topic
+
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Ref ImageName
+      Description: !Ref Description
+      Distributions:
+        - Region: ap-southeast-2
+          AmiDistributionConfiguration:
+            Name: !Sub "${ImageName}-{{imagebuilder:buildDate}}"
+            Description: !Ref Description
+            AmiTags:
+              Name: !Ref ImageName
+            LaunchPermissionConfiguration:
+              UserIds: [!Sub "${AWS::AccountId}"]
+
+  Recipe:
+    Type: "AWS::ImageBuilder::ImageRecipe"
+    Properties:
+      Name: !Ref ImageName
+      Version: !Ref Version
+      ParentImage: !Ref BaseImageArn
+      Description: !Ref Description
+      Components:
+        - ComponentArn: "arn:aws:imagebuilder:ap-southeast-2:aws:component/update-windows/x.x.x"
+        - ComponentArn: "arn:aws:imagebuilder:ap-southeast-2:aws:component/dotnet-core-runtime-windows/x.x.x"
+        - ComponentArn: "arn:aws:imagebuilder:ap-southeast-2:aws:component/stig-build-windows-medium/x.x.x"
+        - ComponentArn: !Ref CisLevelOneComponent
+        - ComponentArn: "arn:aws:imagebuilder:ap-southeast-2:aws:component/ebs-volume-usage-test-windows/x.x.x"
+      Tags:
+        Name: !Ref ImageName
+
+  CisLevelOneComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: "CISLevelOneConfigurations"
+      Description: "Retrieves the custom CIS level one configuration PowerShell script and then executes it"
+      Platform: "Windows"
+      Version: !Ref Version
+      Data:
+        Fn::Sub: |
+          name: 'Download and execute a CIS configuration script'
+          description: 'Execution of CIS level one configuration script'
+          schemaVersion: 1.0
+          phases:
+            - name: build
+              steps:
+                - name: CreateTempDirectory
+                  action: ExecutePowerShell
+                  onFailure: Abort
+                  maxAttempts: 3
+                  inputs:
+                    commands:
+                      - New-Item -Path "C:\" -Name "temp" -ItemType "directory"
+                - name: DownloadSetupScript
+                  action: S3Download
+                  onFailure: Abort
+                  maxAttempts: 3
+                  inputs:
+                    - source: s3://${CisScriptS3Uri}/cis_config_setup.ps1
+                      destination: C:\temp\cis_config_setup.ps1
+                - name: DownloadConfigScript
+                  action: S3Download
+                  onFailure: Abort
+                  maxAttempts: 3
+                  inputs:
+                    - source: s3://${CisScriptS3Uri}/cis_config.ps1
+                      destination: C:\temp\cis_config.ps1
+                - name: ExecuteScript
+                  action: ExecutePowerShell
+                  onFailure: Abort
+                  maxAttempts: 3
+                  inputs:
+                    commands:
+                      - cd c:\temp
+                      - .\cis_config_setup.ps1
+                - name: Cleanup
+                  action: ExecutePowerShell
+                  inputs:
+                    commands:
+                      - cd C:\
+                      - Remove-Item -LiteralPath C:\temp -Force -Recurse
